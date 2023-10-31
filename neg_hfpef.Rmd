@@ -1,0 +1,1312 @@
+---
+title: "Lipids (neg) uptake/release in HFpEF and healthy groups"
+author: "Mengbo Li"
+date: "`r Sys.Date()`"
+output: 
+   html_document:
+      code_folding: show
+      toc: true
+      toc_float:
+          collapsed: false
+          smooth_scroll: false
+      toc_depth: 3
+      number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r global options, include = FALSE, cache = FALSE}
+options(max.print = "80", digits = 4)
+knitr::opts_chunk$set(echo = FALSE,
+                      cache = FALSE,
+                      prompt = FALSE,
+                      tidy = TRUE,
+                      comment = NA,
+                      message = FALSE,
+                      warning = FALSE, 
+                      fig.align = "center")
+```
+
+
+# Summary
+
+In this report, we look at fatty acid (FA) uptake/release in the HFpEF vs healthy control groups. I start with the metabolite data normalized by Eugene in this report. 
+
+```{r}
+library(here)
+library(tidyverse)
+library(ggthemeML)
+library(limma)
+library(ruvms)
+library(protDP)
+library(DT)
+library(pheatmap)
+library(ggpubr)
+library(ggvenn)
+library(GGally)
+library(scatterpie)
+```
+
+
+```{r}
+# colors
+cond.col <- mengbo_pal("main")(10)[c(4, 7)]
+sex.col <- mengbo_pal("pastel")(10)[c(9, 3)]
+sig.col <- c(mengbo_pal("opposite")(10)[c(4, 3)], "#B4B4B4")
+cor.range <-  colorRampPalette(rev(c(RColorBrewer::brewer.pal(11, "PiYG")[10:7], 
+                                     RColorBrewer::brewer.pal(11, "PRGn")[6:2])))(80)
+```
+
+```{r}
+# utils
+source("../221218-utils.R")
+# cleaned data
+load(here("data/230314-neg_lipid_data_for_HFpEF_QCed.rda"))
+```
+
+
+# Data and sample summary
+
+Lipids with multiple transitions (duplicates) were cleaned up by picking the transition with the lower CV. 
+
+```{r}
+meta <- neg_meta
+table(meta$grouping)
+```
+
+
+## Group summary
+
+We have paired sample for each subject at ART and CS sites. 
+
+```{r}
+# table(colnames(neg) == meta$sample_name)
+meta <- mutate(meta, .after = 2, subject = str_remove(sample_name, "_CS")) |> 
+  mutate(subject = str_remove(subject, " ")) |> 
+  mutate(subject = str_replace(subject, "-", ""))
+```
+
+
+```{r}
+meta_metab <- read.csv(here("tables/metabolite/230221-metab_Fig1A_demo.csv"))
+
+ggvenn(list(Metab = unique(meta_metab$subject), 
+            NEG = unique(meta$subject))) +
+  ggtitle("Subject overlap")
+```
+
+1 less patient in negative lipids:
+
+```{r}
+setdiff(unique(meta_metab$subject), unique(meta$subject))
+# setdiff(unique(meta$subject), unique(meta_metab$subject))
+```
+
+
+
+
+## RLA plots
+
+Check the normalization 
+
+```{r}
+#| fig-width: 5
+#| fig-height: 4
+RLA(t(neg[, meta$sample_name[order(meta$run_order)]]), 
+    smpName = meta$run_order[order(meta$run_order)], 
+    repCol = mengbo_pal("main")(15)[as.numeric(as.factor(meta$batch))], 
+    ylim = c(-2.5, 2.5),
+    guides = c(-1, -0.5, 0.5, 1), 
+    title = "Normalized data - RUVIII")
+```
+
+Not good. Further normalized by cyclic loess. 
+
+
+## MDS plots
+
+```{r}
+#| fig-width: 6
+#| fig-height: 4
+
+mds <- ggMDS(neg, meta, "sample_name")
+
+ggplot(mds, aes(x = x, y = y, color = grouping, shape = sampling_site)) + 
+  geom_point(size = 3, alpha = 1, stroke = 1) + 
+  theme_mengbo() + 
+  scale_shape_manual(values = c(16, 8)) + 
+  scale_color_manual(values = cond.col) + 
+  labs(x = "Leading logFC dim 1", 
+       y = "Leading logFC dim 2", 
+       color = "Group", 
+       shape = "Location")
+```
+
+
+
+
+
+
+
+# Problem 1 - Metabolite uptake and release
+
+Adjusted for log2-age
+
+```{r}
+meta <- mutate(meta, log2age = log2(age), .before = age)
+meta <- mutate(meta, group = str_c(grouping, sampling_site, sep = "_"), .before = 2)
+# table(meta$group)
+design <- model.matrix(~ 0 + group + log2age, data = meta)
+colnames(design) <- str_remove(colnames(design), "group")
+contrasts <- makeContrasts(usage_healthy = Healthy_CS - Healthy_ART, 
+                           usage_HFPEF = HFPEF_CS - HFPEF_ART, 
+                           CS_healthyVsHFPEF = HFPEF_CS - Healthy_CS, 
+                           ART_healthyVsHFPEF = HFPEF_ART - Healthy_ART, 
+                           levels = design)
+# contrasts
+```
+
+## DE tables
+
+```{r}
+dupcor <- duplicateCorrelation(neg, design, block = meta$subject)
+fit <- lmFit(neg, design, block = meta$subject, correlation = dupcor$consensus.correlation)
+fit <- contrasts.fit(fit, contrasts = contrasts)
+efit <- eBayes(fit, trend = TRUE)
+# efit$df.prior
+summary(decideTests(efit))
+```
+
+```{r, eval = FALSE, include=FALSE}
+ind_hc_cs <- filter(meta, group == "Healthy_CS")
+ind_hc_art <- filter(meta, group == "Healthy_ART")
+ind_hfpef_cs <- filter(meta, group == "HFPEF_CS")
+ind_hfpef_art <- filter(meta, group == "HFPEF_ART")
+# table(colnames(neg) == meta$sample_name)
+
+# usage_healthy
+df1 <- cbind(neg[, ind_hc_cs$sample_name], neg[, ind_hc_art$sample_name])
+df1 <- as.data.frame(df1) |> 
+  rownames_to_column("lipid_names")
+dim(df1)
+df1_ref <- readxl::read_xlsx("data/lipids/BioPan/neg/230605-neg_normalised_Healthy_CSandHealthy_ART-LipidLynxX-Converter-20230605-051752-e7a6.xlsx")
+keep <- df1$lipid_names %in% df1_ref$TextInput
+table(keep)
+# write.csv(df1[keep, ], file = "data/lipids/230605-neg_normalised_Healthy_CSandHealthy_ART.csv", row.names = FALSE)
+```
+
+
+## Uptake vs releaese in both groups
+
+Usage is calculated as Healthy_CS - Healthy_ART, so a negative logFC means lower abundance in CS than ART, which is uptake. Based on the number of DE metabolite counts, there is more uptake than release in the metabolites in both healthy and HFpEF. (Up =release; down = uptake). 
+
+```{r}
+#| fig.height: 4
+#| fig.width: 6
+
+# DE summary
+ggarrange(deBar(efit, 
+                coef = "usage_healthy", 
+                sig.levels = c("Release", "Uptake", "UnSig"), 
+                rotate.x.text = TRUE) + 
+            ggtitle("Healthy"), 
+          deBar(efit, 
+                coef = "usage_HFPEF", 
+                sig.levels = c("Release", "Uptake", "UnSig"), 
+                rotate.x.text = TRUE) + 
+            ggtitle("HFpEF"), 
+          nrow = 1)
+```
+
+
+## Metabolite usage in healthy subjects
+
+```{r}
+topTable(efit, coef = "usage_healthy", number = Inf) |>
+  mutate(FC = unlog2FC(logFC), .after = 1) |> 
+  signif(2) |> 
+  datatable()
+
+# # write output
+# topTable(efit, coef = "usage_healthy", number = Inf) |>
+#   mutate(FC = unlog2FC(logFC), .after = 1) |>
+#   write.csv(file = "tables/neg/230315-neg_lipids_FigXXXX_DA_CSminusART_HEALTHY.csv")
+```
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+
+# volcano plot
+efit$genes <- data.frame(feature = rownames(neg)) |> 
+  mutate(Symbol = feature) |> 
+  column_to_rownames("feature")
+
+usage_hc <- plotVolcano(efit, 
+                        sig.levels = c("Release", "Uptake", "UnSig"), 
+                        coef = "usage_healthy", 
+                        guide = 0.05, sig.col[2:3], 
+                        label.P.neg = 0.05, lable.P.pos = 0.05, 
+                        label.logFC.neg = 0, label.logFC.pos = 0)
+```
+
+
+
+
+
+## Metabolite usage in HFpEF subjects
+
+
+Usage is calculated as HFPEF_CS - HFPEF_ART, so a negative logFC means lower abundance in CS than ART. 
+
+```{r}
+topTable(efit, coef = "usage_HFPEF", number = Inf) |> 
+  select(-Symbol) |> 
+  mutate(FC = unlog2FC(logFC), .after = 1) |> 
+  signif(2) |> 
+  datatable()
+
+# # write output
+# topTable(efit, coef = "usage_HFPEF", number = Inf) |>
+#   select(-Symbol) |>
+#   mutate(FC = unlog2FC(logFC), .after = 1) |>
+#   write.csv(file = "tables/neg/230315-neg_lipids_FigXXXX_DA_CSminusART_HFPEF.csv")
+```
+
+
+```{r}
+#| fig-width: 14
+#| fig-height: 4
+
+# volcano plot
+usage_hf <- plotVolcano(efit, 
+                        sig.levels = c("Release", "Uptake", "UnSig"), 
+                        coef = "usage_HFPEF", 
+                        guide = 0.05, sig.col, 
+                        label.P.neg = 0.05, lable.P.pos = 0.05, 
+                        label.logFC.neg = 0, label.logFC.pos = 0)
+
+ggarrange(usage_hc, usage_hf, ncol = 2, nrow = 1, labels = c("Control", "HFpEF"))
+```
+
+
+## Metabolite usage - HFpEF vs healthy
+
+All DE metabolites:
+
+```{r}
+usage_dt <- decideTests(efit) |> as.data.frame()
+usage <- list(healthy = rownames(usage_dt)[usage_dt$usage_healthy != 0], 
+              hfpef = rownames(usage_dt)[usage_dt$usage_HFPEF != 0])
+ggvenn(usage)
+```
+
+Metabolites in each category:
+
+```{r}
+(tmp <- list(overlap = intersect(usage$healthy, usage$hfpef), 
+             healthy_only = setdiff(usage$healthy, usage$hfpef), 
+             hfpef = setdiff(usage$hfpef, usage$healthy)))
+```
+
+
+Metabolites significantly uptaken by each group (CS > ART):
+
+```{r}
+usage <- list(healthy = rownames(usage_dt)[usage_dt$usage_healthy == 1], 
+              hfpef = rownames(usage_dt)[usage_dt$usage_HFPEF == 1])
+usage
+ggvenn(usage)
+```
+
+
+Metabolites significantly released by each group (CS < ART):
+
+```{r}
+usage <- list(healthy = rownames(usage_dt)[usage_dt$usage_healthy == -1], 
+              hfpef = rownames(usage_dt)[usage_dt$usage_HFPEF == -1])
+ggvenn(usage)
+```
+
+Metabolites in each category:
+
+```{r}
+(tmp <- list(overlap = intersect(usage$healthy, usage$hfpef), 
+             healthy_only = setdiff(usage$healthy, usage$hfpef), 
+             hfpef = setdiff(usage$hfpef, usage$healthy)))
+```
+
+
+
+
+
+## Usage/release in two conditions
+
+```{r}
+usage <- list(healthy = rownames(usage_dt)[usage_dt$usage_healthy != 0], 
+              hfpef = rownames(usage_dt)[usage_dt$usage_HFPEF != 0])
+tmp <- list(overlap = intersect(usage$healthy, usage$hfpef), 
+            healthy_only = setdiff(usage$healthy, usage$hfpef), 
+            hfpef = setdiff(usage$hfpef, usage$healthy))
+
+compareLogFC(efit, 
+             coef1 = "usage_healthy", coef2 = "usage_HFPEF", 
+             x.title = "log2(CS/ART) in healthy", y.title = "log2(CS/ART) in HFpEF", 
+             extra.labels = c(tmp$healthy_only, tmp$hfpef),
+             coef1.name = "Healthy", coef2.name = "HFpEF", 
+             pt.cex = c(2, 3, 4))
+```
+
+
+
+# Problem 2 - uptake/usage versus circulating concentrations
+
+Is usage related to the circulating concentration of metabolites. Are metabolites significantly used by the heart those more abundant in the ART? -> by MA plot. 
+
+## Healthy
+
+```{r}
+# group Amean of ART samples
+neg_art <- neg[, meta$sample_name[meta$sampling_site == "ART"]]
+ARTameans <- data.frame(feature = rownames(neg_art), grpAmean = rowMeans(neg_art, na.rm = TRUE))
+
+# median of average log-expression in all metabolites
+md_hc <- plotMeanDiff(efit, coef = "usage_healthy", 
+                      sig.col = sig.col[2:3], 
+                      sig.levels = c("Release", "Uptake", "UnSig"), 
+                      label.logFC.neg = 0.5, label.size = 3, 
+                      grpAveExpr = ARTameans) + 
+  geom_vline(xintercept = median(efit$Amean)) + 
+  labs(x = "Average log2abundance", 
+       title = "Healthy") + 
+  annotate("rect", xmin = -Inf, xmax = median(efit$Amean), ymin = -Inf, ymax = 0, 
+           fill = "#a6a6a6", alpha = 0.1) + 
+  annotate("rect", xmin = median(efit$Amean), xmax = Inf, ymin = 0, ymax = Inf, 
+           fill = "#a6a6a6", alpha = 0.1)
+# md_hc
+
+art_amean_hist <- data.frame(Ameans = ARTameans$grpAmean) |> 
+  ggplot(aes(x = Ameans, fill = 1)) + 
+  geom_histogram(bins = 40, alpha = 0.5, color = "black", show.legend = FALSE) + 
+  geom_vline(xintercept = median(efit$Amean), linewidth = 1) + 
+  theme_mengbo()
+# art_amean_hist
+```
+
+## HFpEF
+
+```{r}
+# median of average log-expression in all metabolites
+md_hf <- plotMeanDiff(efit, coef = "usage_HFPEF", 
+                      sig.col = sig.col, 
+                      sig.levels = c("Release", "Uptake", "UnSig"), 
+                      label.logFC.neg = 0, label.size = 3,
+                      grpAveExpr = ARTameans) + 
+  geom_vline(xintercept = median(efit$Amean)) + 
+  labs(x = "Average log2abundance", 
+       title = "HFpEF") + 
+  annotate("rect", xmin = -Inf, xmax = median(efit$Amean), ymin = -Inf, ymax = 0, 
+           fill = "#a6a6a6", alpha = 0.1) + 
+  annotate("rect", xmin = median(efit$Amean), xmax = Inf, ymin = 0, ymax = Inf, 
+           fill = "#a6a6a6", alpha = 0.1)
+# md_hf
+```
+
+
+```{r}
+#| fig-width: 14
+#| fig-height: 7
+
+ggarrange(md_hc + theme(legend.position = "none"), 
+          md_hf + theme(legend.position = "none"), 
+          art_amean_hist, 
+          ncol = 2, nrow = 2)
+
+# 7x3 dimension
+ggarrange(art_amean_hist + theme(legend.position = "none", axis.text = element_blank(), axis.title = element_blank()), 
+          md_hc + theme(legend.position = "none", axis.text = element_blank(), axis.title = element_blank()), 
+          md_hf + theme(legend.position = "none", axis.text = element_blank(), axis.title = element_blank()), 
+          ncol = 1, nrow = 3)
+```
+
+
+
+
+
+
+
+# Problem 3 - sex difference
+
+Different usage in each gender, adjusted for log2-age. 
+
+```{r}
+meta <- mutate(meta, group2 = str_c(group, gender, sep = "_"), .before = 2)
+# table(meta$group2)
+
+design <- model.matrix(~ 0 + group2 + log2age, data = meta)
+colnames(design) <- str_remove(colnames(design), "group2")
+contrasts <- makeContrasts(usage_healthy_female = Healthy_CS_female - Healthy_ART_female, 
+                           usage_HFPEF_female = HFPEF_CS_female - HFPEF_ART_female, 
+                           usage_healthy_male = Healthy_CS_male - Healthy_ART_male, 
+                           usage_HFPEF_male = HFPEF_CS_male - HFPEF_ART_male, 
+                           CS_healthyVsHFPEF_female = HFPEF_CS_female - Healthy_CS_female, 
+                           ART_healthyVsHFPEF_female = HFPEF_ART_female - Healthy_ART_female, 
+                           CS_healthyVsHFPEF_male = HFPEF_CS_male - Healthy_CS_male, 
+                           ART_healthyVsHFPEF_male = HFPEF_ART_male - Healthy_ART_male, 
+                           levels = design)
+```
+
+
+## DE tables
+
+```{r}
+dupcor <- duplicateCorrelation(neg, design, block = meta$subject)
+fit <- lmFit(neg, design, block = meta$subject, correlation = dupcor$consensus.correlation)
+fit <- contrasts.fit(fit, contrasts = contrasts)
+efit <- eBayes(fit, trend = TRUE)
+# efit$df.prior
+summary(decideTests(efit))
+```
+
+
+
+DE barplots
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+
+ggarrange(deBar(efit, 
+                coef = "usage_healthy_female", 
+                sig.levels = c("Release", "Uptake", "UnSig"), 
+                rotate.x.text = TRUE) + 
+            ggtitle("Healthy-female"), 
+          deBar(efit, 
+                coef = "usage_healthy_male", 
+                sig.levels = c("Release", "Uptake", "UnSig"), 
+                rotate.x.text = TRUE) +
+            ggtitle("Healthy-male"), 
+          deBar(efit, 
+                coef = "usage_HFPEF_female", 
+                sig.levels = c("Release", "Uptake", "UnSig"), 
+                rotate.x.text = TRUE) +
+            ggtitle("HFpEF-female"), 
+          deBar(efit, 
+                coef = "usage_HFPEF_male", 
+                sig.levels = c("Release", "Uptake", "UnSig"), 
+                rotate.x.text = TRUE) +
+            ggtitle("HFpEF-male"), 
+          ncol = 2, nrow = 2)
+```
+
+
+
+
+
+
+### Metabolite usage in healthy female
+
+Usage is calculated as Healthy_CS_female - Healthy_ART_female, so a negative logFC means lower abundance in CS than ART. 
+
+```{r}
+topTable(efit, coef = "usage_healthy_female", number = Inf) |> 
+  mutate(FC = unlog2FC(logFC), .after = 1) |>
+  signif(2) |> 
+  datatable()
+
+# # write output
+# topTable(efit, coef = "usage_healthy_female", number = Inf) |>
+#   mutate(FC = unlog2FC(logFC), .after = 1) |>
+#   write.csv(file = "tables/neg/230315-neg_lipids_FigXXXX_DA_CSminusART_HEALTHYandFEMALE.csv")
+```
+
+
+### Metabolite usage in healthy male
+
+Usage is calculated as Healthy_CS_male - Healthy_ART_male, so a negative logFC means lower abundance in CS than ART. 
+
+```{r}
+topTable(efit, coef = "usage_healthy_male", number = Inf) |> 
+  mutate(FC = unlog2FC(logFC), .after = 1) |>
+  signif(2) |> 
+  datatable()
+
+# # write output
+# topTable(efit, coef = "usage_healthy_male", number = Inf) |>
+#   mutate(FC = unlog2FC(logFC), .after = 1) |>
+#   write.csv(file = "tables/neg/230315-neg_lipids_FigXXXX_DA_CSminusART_HEALTHYandMALE.csv")
+```
+
+No differential usage in the healthy cohort. 
+
+```{r}
+usage_dt <- decideTests(efit) |> as.data.frame()
+use_hc <- list(diffUse_female_hc = rownames(usage_dt)[usage_dt$usage_healthy_female != 0], 
+               diffUse_male_hc = rownames(usage_dt)[usage_dt$usage_healthy_male != 0])
+ggvenn(use_hc)
+```
+
+
+### Metabolite usage in HFPEF female
+
+Usage is calculated as Healthy_CS_female - Healthy_ART_female, so a negative logFC means lower abundance in CS than ART. 
+
+```{r}
+topTable(efit, coef = "usage_HFPEF_female", number = Inf) |> 
+  mutate(FC = unlog2FC(logFC), .after = 1) |>
+  signif(2) |> 
+  datatable()
+
+# # write output
+# topTable(efit, coef = "usage_HFPEF_female", number = Inf) |>
+#   mutate(FC = unlog2FC(logFC), .after = 1) |>
+#   write.csv(file = "tables/neg/230315-neg_lipids_FigXXXX_DA_CSminusART_HFpEFandFEMALE.csv")
+```
+
+### Metabolite usage in HFPEF male
+
+Usage is calculated as Healthy_CS_male - Healthy_ART_male, so a negative logFC means lower abundance in CS than ART. 
+
+```{r}
+topTable(efit, coef = "usage_HFPEF_male", number = Inf) |> 
+  mutate(FC = unlog2FC(logFC), .after = 1) |>
+  signif(2) |> 
+  datatable()
+
+# # write output
+# topTable(efit, coef = "usage_HFPEF_male", number = Inf) |>
+#   mutate(FC = unlog2FC(logFC), .after = 1) |>
+#   write.csv(file = "tables/neg/230315-neg_lipids_FigXXXX_DA_CSminusART_HFpEFandMALE.csv")
+```
+
+There is a big sex difference in metabolite usage in male vs female:
+
+```{r}
+use_hfpef <- list(diffUse_female_hf = rownames(usage_dt)[usage_dt$usage_HFPEF_female != 0], 
+                  diffUse_male_hf = rownames(usage_dt)[usage_dt$usage_HFPEF_male != 0])
+ggvenn(use_hfpef)
+```
+
+<!-- where metabolites differentially used in both genders -->
+
+<!-- ```{r} -->
+<!-- intersect(use_hfpef$diffUse_female_hf, use_hfpef$diffUse_male_hf) -->
+<!-- ``` -->
+
+
+<!-- Only in female HFPEFs -->
+
+<!-- ```{r} -->
+<!-- setdiff(use_hfpef$diffUse_female_hf, use_hfpef$diffUse_male_hf) -->
+<!-- ``` -->
+
+
+<!-- Only in male HFPEFs -->
+
+<!-- ```{r} -->
+<!-- setdiff(use_hfpef$diffUse_male_hf, use_hfpef$diffUse_female_hf) -->
+<!-- ``` -->
+
+
+### HFPEF-Male
+
+Lipid classes of DA lipids
+
+```{r}
+da_neg_lipids <- rownames(efit)[decideTests(efit)[, "usage_HFPEF_male"] != 0]
+da_neg <- filter(neg_lipids, clean_final %in% da_neg_lipids) |> 
+  mutate(Direction = as.factor(decideTests(efit)[da_neg_lipids, "usage_HFPEF_male"]), .after = 1)
+levels(da_neg$Direction) <- c("Uptake", "Release")
+table(da_neg$Direction)
+table(da_neg$class)
+
+# pie chart
+ggplot(da_neg, aes(x = 0, fill = class))+
+  geom_bar(width = 1) +
+  scale_x_continuous(expand = c(0,0)) +
+  geom_text(aes(label = after_stat(count)), stat = "count", 
+            position = position_stack(vjust = 0.5), size = 6) + 
+  coord_polar("y") +
+  scale_fill_manual(values = mengbo_pal("light")(7)) + 
+  theme_void() + 
+  labs(fill = "", title = "Lipid classes of DA lipids in HFpEF-male")
+```
+
+
+```{r}
+da_neg_tile <- da_neg |> 
+  select(class, clean_final, Direction, fa1, fa2) |> 
+  pivot_longer(4:5) |> 
+  filter(value != "") |> 
+  select(-name) |> 
+  mutate(Carbon = str_split_fixed(value, ":", 2)[, 1]) |> 
+  mutate(`Double bonds` = str_split_fixed(value, ":", 2)[, 2]) |> 
+  mutate(Carbon = as.integer(Carbon), 
+         `Double bonds` = as.integer(`Double bonds`))
+```
+
+```{r}
+#| fig.width: 10
+#| fig.height: 3
+
+# release
+filter(da_neg_tile, Direction == "Release") |> 
+  group_by(class, value) |> 
+  mutate(fa_occurance = as.character(length(value))) |> 
+  ggplot(aes(x = Carbon, y = `Double bonds`, fill = fa_occurance)) +
+  geom_tile(color = "white", linewidth = 0.2, alpha = 0.8, show.legend = FALSE) + 
+  scale_fill_manual(values = ggsci::rgb_material("red")[c(3, 6, 9)]) + 
+  geom_text(aes(label = fa_occurance), size = 5, vjust = 0.5, color = "black") +
+  facet_wrap(~ class, nrow = 1) + 
+  scale_x_continuous(limits = c(15, 25), breaks = 16:24) +
+  theme_mengbo(clean_background = FALSE) + 
+  ggtitle("Significantly released lipids")
+```
+
+
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+
+# uptake
+filter(da_neg_tile, Direction == "Uptake") |> 
+  group_by(class, value) |> 
+  mutate(fa_occurance = as.character(length(value))) |> 
+  ggplot(aes(x = Carbon, y = `Double bonds`, fill = fa_occurance)) +
+  geom_tile(color = "white", linewidth = 0.2, alpha = 0.8, show.legend = FALSE) + 
+  scale_fill_manual(values = ggsci::rgb_material("blue")[c(2, 4, 7, 10)]) + 
+  geom_text(aes(label = fa_occurance), size = 5, vjust = 0.5, color = "black") +
+  facet_wrap(~ class, nrow = 1) + 
+  scale_x_continuous(limits = c(14.5, 25.5), breaks = 15:25) +
+  scale_y_continuous(limits = c(-0.5, 6.5), breaks = 0:6) +
+  theme_mengbo(clean_background = FALSE) + 
+  ggtitle("Significantly uptaken lipids")
+```
+
+
+```{r}
+# uptake and release in one plot
+da_neg_release <- filter(da_neg_tile, Direction == "Release") |>
+  group_by(class, value) |> 
+  mutate(fa_occurance = as.character(length(value))) |> 
+  select(-clean_final) |> 
+  distinct() |> 
+  rename(fa_occurance_release = fa_occurance) |> 
+  select(-Direction) |> 
+  mutate(fa_occurance_uptake = NA) |> 
+  ungroup()
+
+da_neg_uptake <- filter(da_neg_tile, Direction == "Uptake") |>
+  group_by(class, value) |> 
+  mutate(fa_occurance = as.character(length(value))) |> 
+  select(-clean_final) |> 
+  distinct() |> 
+  rename(fa_occurance_uptake = fa_occurance) |> 
+  select(-Direction) |> 
+  mutate(fa_occurance_release = NA) |> 
+  ungroup()
+
+da_neg_pie <- add_row(da_neg_release, da_neg_uptake) |> 
+  mutate(fa_occurance_release = as.numeric(fa_occurance_release), 
+         fa_occurance_uptake = as.numeric(fa_occurance_uptake)) |> 
+  mutate(fa_occurance_release = ifelse(is.na(fa_occurance_release), 0, fa_occurance_release), 
+         fa_occurance_uptake = ifelse(is.na(fa_occurance_uptake), 0, fa_occurance_uptake)) |> 
+  group_by(class, value, Carbon, `Double bonds`) |> 
+  summarise(fa_occurance_release = sum(fa_occurance_release), 
+            fa_occurance_uptake = sum(fa_occurance_uptake)) |> 
+  ungroup() |> 
+  mutate(fa_occurance_total = fa_occurance_release + fa_occurance_uptake) |> 
+  mutate(radius = fa_occurance_total/10)
+
+table(da_neg_pie$radius)
+
+
+ggplot() + 
+  geom_scatterpie(data = da_neg_pie, aes(x = Carbon, y = `Double bonds`), 
+                  cols = c("fa_occurance_uptake", "fa_occurance_release"), 
+                  pie_scale = 2, 
+                  legend_name = "Direction") + 
+  facet_wrap(~ class, nrow = 1) +
+  scale_fill_manual(values = c(ggsci::rgb_material("blue")[4], 
+                               ggsci::rgb_material("red")[4]), 
+                    labels = c("Uptake", "Release")) + 
+  scale_x_continuous(limits = c(14.5, 25.5), breaks = 15:25) +
+  scale_y_continuous(limits = c(-0.5, 6.5), breaks = 0:6) + 
+  theme_mengbo(clean_background = FALSE) + 
+  ggtitle("Significant DA usage neg lipids in HFpEF male") + 
+  theme(axis.text = element_text(size = 12)) +
+  labs(x = "Carbons", y = "Double bonds")
+
+ggplot() + 
+  geom_scatterpie(data = da_neg_pie, aes(x = Carbon, y = `Double bonds`, r = radius), 
+                  cols = c("fa_occurance_uptake", "fa_occurance_release"), 
+                  legend_name = "Direction") + 
+  facet_wrap(~ class, nrow = 1) +
+  scale_fill_manual(values = c(ggsci::rgb_material("blue")[4], 
+                               ggsci::rgb_material("red")[4]), 
+                    labels = c("Uptake", "Release")) + 
+  scale_x_continuous(limits = c(14.5, 25.5), breaks = 15:25) +
+  scale_y_continuous(limits = c(-0.5, 6.5), breaks = 0:6) + 
+  theme_mengbo(clean_background = FALSE) + 
+  ggtitle("Significant DA usage neg lipids in HFpEF male") + 
+  theme(axis.text = element_text(size = 12)) +
+  geom_scatterpie_legend(radius = da_neg_pie$radius, n = 5, x = 16, y = 5, 
+                         labeller = function(x) {x = sort(unique(da_neg_pie$fa_occurance_total))}) + 
+  labs(x = "Carbons", y = "Double bonds")
+```
+
+
+
+
+
+## Volcano plots
+
+```{r}
+#| fig.width: 12
+#| fig.height: 10
+#| 
+# volcano plot
+efit$genes <- data.frame(feature = rownames(neg)) |> 
+  mutate(Symbol = feature) |> 
+  column_to_rownames("feature")
+
+vol_HCfemale <- plotVolcano(efit, 
+                            sig.levels = c("Release", "Uptake", "UnSig"), 
+                            coef = "usage_healthy_female", 
+                            guide = 0.05, sig.col = sig.col[2:3]) + 
+  ggtitle("Healthy - Female")
+vol_usage_HCmale <- plotVolcano(efit, 
+                                sig.levels = c("Release", "Uptake", "UnSig"), 
+                                coef = "usage_healthy_male", 
+                                guide = 0.05, sig.col = sig.col[3], 
+                                label.P.neg = 1e-2) + 
+  ggtitle("Healthy - Male")
+vol_usage_HFfemale <- plotVolcano(efit, 
+                                  sig.levels = c("Release", "Uptake", "UnSig"), 
+                                  coef = "usage_HFPEF_female", 
+                                  guide = 0.05, sig.col = sig.col[3]) + 
+  ggtitle("HFpEF - Female")
+vol_usage_HFmale <- plotVolcano(efit, 
+                                sig.levels = c("Release", "Uptake", "UnSig"), 
+                                coef = "usage_HFPEF_male", 
+                                guide = 0.05, sig.col = sig.col, 
+                                label.P.neg = 0.01, lable.P.pos = 0.01) + 
+  ggtitle("HFpEF - Male")
+
+ggarrange(vol_HCfemale, vol_usage_HCmale, vol_usage_HFfemale, vol_usage_HFmale)
+```
+
+
+## Top rank plot
+
+### Healthy
+
+```{r}
+sex_hc <- topTable(efit, coef = "usage_healthy_female", number = Inf) |> 
+  rownames_to_column("feature") |> 
+  select(feature, logFC, adj.P.Val) |> 
+  mutate(coef = "usage_healthy_female", 
+         p.rank = order(adj.P.Val))
+sex_hc_dt <- decideTests(efit) |> 
+  as.data.frame() |> 
+  select(all_of("usage_healthy_female")) |> 
+  rename(sign_coef = 1) |> 
+  mutate(sign_coef = factor(sign_coef, levels = c(1, -1, 0))) |> 
+  rownames_to_column("feature")
+levels(sex_hc_dt$sign_coef) <- c("Release", "Uptake", "UnSig")
+sex_hc <- left_join(sex_hc, sex_hc_dt, by = "feature")
+
+sex_hc_tmp <- topTable(efit, coef = "usage_healthy_male", number = Inf) |> 
+  rownames_to_column("feature") |> 
+  select(feature, logFC, adj.P.Val) |> 
+  mutate(coef = "usage_healthy_male", 
+         p.rank = order(adj.P.Val))
+sex_hc_dt_tmp <- decideTests(efit) |> 
+  as.data.frame() |> 
+  select(all_of("usage_healthy_male")) |> 
+  rename(sign_coef = 1) |> 
+  mutate(sign_coef = factor(sign_coef, levels = c(1, -1, 0))) |> 
+  rownames_to_column("feature")
+levels(sex_hc_dt_tmp$sign_coef) <- c("Release", "Uptake", "UnSig")
+sex_hc_tmp <- left_join(sex_hc_tmp, sex_hc_dt_tmp, by = "feature")
+
+
+sex_hc <- left_join(sex_hc, sex_hc_tmp, by = "feature") |> 
+  mutate(class = case_when(sign_coef.x != "UnSig" & sign_coef.y != "UnSig" ~ "Both", 
+                           sign_coef.x != "UnSig" & sign_coef.y == "UnSig" ~ "usage_healthy_female", 
+                           sign_coef.x == "UnSig" & sign_coef.y != "UnSig" ~ "usage_healthy_male", 
+                           TRUE ~ "None")) |> 
+  mutate(class = factor(class, levels = c("Both", 
+                                          "usage_healthy_female",
+                                          "usage_healthy_male",
+                                          "None")))
+rm(sex_hc_tmp, sex_hc_dt, sex_hc_dt_tmp)
+```
+
+Rank order plot
+
+```{r}
+#| fig.width: 7
+#| fig.height: 8
+## plot
+# table(sex_hc$class)
+rank_hc <- ggparcoord(data = sex_hc, columns = c(5, 10),
+                      groupColumn = "class",
+                      scale = "globalminmax", 
+                      showPoints = TRUE) + 
+  scale_y_reverse() + 
+  scale_color_manual(values = c(sex.col[1], "#F2F2F2"), 
+                     labels = c("Only female", "Neither")) + 
+  theme_mengbo(clean_background = FALSE) + 
+  scale_x_discrete(labels = c("Female", "Male")) + 
+  labs(title = "Healthy", 
+       x = "", 
+       y = "Rank by adjusted p-value", 
+       color = "Significant in")
+
+anno_data <- mutate(rank_hc$data, metabolite = rep(sex_hc$feature, 2)) |> 
+  filter(variable == "p.rank.x", 
+         class != "None")
+rank_hc <- rank_hc + 
+  geom_text(data =  anno_data, 
+            aes(label = metabolite), 
+            color = "black", 
+            size  = 2.5, hjust = 1, nudge_x = -0.02)
+rank_hc
+```
+
+
+
+
+### HFPEF
+
+```{r}
+sex_hf <- topTable(efit, coef = "usage_HFPEF_female", number = Inf) |> 
+  rownames_to_column("feature") |> 
+  select(feature, logFC, adj.P.Val) |> 
+  mutate(coef = "usage_HFPEF_female", 
+         p.rank = order(adj.P.Val))
+sex_hf_dt <- decideTests(efit) |> 
+  as.data.frame() |> 
+  select(all_of("usage_HFPEF_female")) |> 
+  rename(sign_coef = 1) |> 
+  mutate(sign_coef = factor(sign_coef, levels = c(1, -1, 0))) |> 
+  rownames_to_column("feature")
+levels(sex_hf_dt$sign_coef) <- c("Release", "Uptake", "UnSig")
+sex_hf <- left_join(sex_hf, sex_hf_dt, by = "feature")
+
+sex_hf_tmp <- topTable(efit, coef = "usage_HFPEF_male", number = Inf) |> 
+  rownames_to_column("feature") |> 
+  select(feature, logFC, adj.P.Val) |> 
+  mutate(coef = "usage_HFPEF_male", 
+         p.rank = order(adj.P.Val))
+sex_hf_dt_tmp <- decideTests(efit) |> 
+  as.data.frame() |> 
+  select(all_of("usage_HFPEF_male")) |> 
+  rename(sign_coef = 1) |> 
+  mutate(sign_coef = factor(sign_coef, levels = c(1, -1, 0))) |> 
+  rownames_to_column("feature")
+levels(sex_hf_dt_tmp$sign_coef) <- c("Release", "Uptake", "UnSig")
+sex_hf_tmp <- left_join(sex_hf_tmp, sex_hf_dt_tmp, by = "feature")
+
+
+sex_hf <- left_join(sex_hf, sex_hf_tmp, by = "feature") |> 
+  mutate(class = case_when(sign_coef.x != "UnSig" & sign_coef.y != "UnSig" ~ "Both", 
+                           sign_coef.x != "UnSig" & sign_coef.y == "UnSig" ~ "usage_HFPEF_female", 
+                           sign_coef.x == "UnSig" & sign_coef.y != "UnSig" ~ "usage_HFPEF_male", 
+                           TRUE ~ "None")) |> 
+  mutate(class = factor(class, levels = c("Both", 
+                                          "usage_HFPEF_female",
+                                          "usage_HFPEF_male",
+                                          "None")))
+rm(sex_hf_tmp, sex_hf_dt, sex_hf_dt_tmp)
+```
+
+Rank order plot
+
+```{r}
+#| fig.width: 7
+#| fig.height: 8
+
+
+# c("#A18CB8", sex.col, "#F2F2F2")
+# c("Both", "Only female", "Only male", "Neither")
+## plot
+# table(sex_hf$class)
+rank_hf <- ggparcoord(sex_hf, columns = c(5, 10), 
+                      groupColumn = "class",
+                      scale = "globalminmax", 
+                      showPoints = TRUE) + 
+  scale_y_reverse() + 
+  scale_color_manual(values = c(sex.col[2], "#F2F2F2"),  
+                     labels = c("Only male", "Neither")) + 
+  theme_mengbo(clean_background = FALSE) + 
+  scale_x_discrete(labels = c("Female", "Male")) + 
+  labs(title = "HFpEF", 
+       x = "", 
+       y = "Rank by adjusted p-value", 
+       color = "Significant in")
+
+anno_data <- mutate(rank_hf$data, metabolite = rep(sex_hf$feature, 2)) |> 
+  filter(variable == "p.rank.x", 
+         class != "None")
+rank_hf <- rank_hf + 
+  geom_text(data =  anno_data, 
+            aes(label = metabolite), 
+            color = "black", 
+            size  = 2.5, hjust = 1, nudge_x = -0.02)
+rank_hf
+```
+
+
+
+
+
+### Female
+
+```{r}
+#| fig.width: 7
+#| fig.height: 8
+sex_hchf <- left_join(sex_hc, sex_hf, by = "feature") |> 
+  mutate(class_female = case_when(sign_coef.x.x != "UnSig" & sign_coef.x.y != "UnSig" ~ "Both", 
+                                  sign_coef.x.x != "UnSig" & sign_coef.x.y == "UnSig" ~ "usage_healthy_female", 
+                                  sign_coef.x.x == "UnSig" & sign_coef.x.y != "UnSig" ~ "usage_HFPEF_female", 
+                                  TRUE ~ "None")) |> 
+  mutate(class_female = factor(class_female, levels = c("Both", 
+                                                        "usage_healthy_female",
+                                                        "usage_HFPEF_female",
+                                                        "None")))
+
+# which(colnames(sex_hchf) %in% c("p.rank.x.x", "p.rank.x.y"))
+# table(sex_hchf$class_female)
+rank_female <- ggparcoord(sex_hchf, 
+                          columns = c(5, 16), 
+                          groupColumn = "class_female",
+                          scale = "globalminmax", 
+                          showPoints = TRUE) + 
+  scale_y_reverse() + 
+  scale_color_manual(values = c(cond.col[1], "#F2F2F2"), 
+                     labels = c("Only control", "Neither")) + 
+  theme_mengbo(clean_background = FALSE) + 
+  scale_x_discrete(labels = c("Control", "HFpEF")) + 
+  labs(title = "Female", 
+       x = "", 
+       y = "Rank by adjusted p-value", 
+       color = "Significant in")
+
+anno_data <- mutate(rank_female$data, metabolite = rep(sex_hchf$feature, 2)) |> 
+  filter(variable == "p.rank.x.x", 
+         class_female != "None")
+rank_female <- rank_female + 
+  geom_text(data = anno_data, 
+            aes(label = metabolite), 
+            color = "black", 
+            size  = 2.5, hjust = 1, nudge_x = -0.02)
+rank_female
+```
+
+### Male
+
+```{r}
+#| fig.width: 7
+#| fig.height: 8
+sex_hchf <- mutate(sex_hchf, 
+                   class_male = case_when(sign_coef.y.x != "UnSig" & sign_coef.y.y != "UnSig" ~ "Both", 
+                                          sign_coef.y.x != "UnSig" & sign_coef.y.y == "UnSig" ~ "usage_healthy_male", 
+                                          sign_coef.y.x == "UnSig" & sign_coef.y.y != "UnSig" ~ "usage_HFPEF_male", 
+                                          TRUE ~ "None")) |> 
+  mutate(class_male = factor(class_male, levels = c("Both", 
+                                                    "usage_healthy_male",
+                                                    "usage_HFPEF_male",
+                                                    "None")))
+
+# which(colnames(sex_hchf) %in% c("p.rank.y.x", "p.rank.y.y"))
+# table(sex_hchf$class_male)
+rank_male <- ggparcoord(sex_hchf, 
+                        columns = c(10, 21), 
+                        groupColumn = "class_male",
+                        scale = "globalminmax", 
+                        showPoints = TRUE) + 
+  scale_y_reverse() + 
+  scale_color_manual(values = c(cond.col[2], "#F2F2F2"), 
+                     labels = c("Only HFpEF", "Neither")) + 
+  theme_mengbo(clean_background = FALSE) + 
+  scale_x_discrete(labels = c("Healthy", "HFpEF")) + 
+  labs(title = "Male", 
+       x = "", 
+       y = "Rank by adjusted p-value", 
+       color = "Significant in")
+
+anno_data <- mutate(rank_male$data, metabolite = rep(sex_hchf$feature, 2)) |> 
+  filter(variable == "p.rank.y.x", 
+         class_male != "None")
+rank_male <- rank_male +
+  geom_text(data = anno_data, 
+            aes(label = metabolite), 
+            color = "black", 
+            size  = 2.5, hjust = 1, nudge_x = -0.02)
+rank_male
+```
+
+
+```{r}
+ggarrange(rank_hc, rank_hf, rank_female, rank_male, ncol = 4)
+```
+
+
+
+
+
+# Problem 4 - Metabolite usage associated with other clinical variables
+
+Distribution of each clinical variable
+
+```{r}
+cont_clin <- c("height", "weight", "BMI", "BSA", "rest_hr", 
+               "rest_dbp", "MAP", "rest_rap", "rest_pas", "rest_pad", 
+               "rest_pam", "rest_pcwp", "rest_co", "rest_ci", "rest_pleth_sat", 
+               "LVSWI", "peak_time_ex_min", "peak_watts", "pcwp_watts_ratio", 
+               "ex_hr", "ex_sbp", "ex_dbp", "ex_rap", "ex_pas", "ex_pad", 
+               "ex_pam", "ex_pcwp", "ex_co", "ex_ci", "LVEF")
+cate_clin <- c("NYHA", "afib", "diabetes")
+```
+
+
+
+```{r}
+#| fig-width: 12
+#| fig-height: 12
+
+ind <- which(colnames(meta) %in% cont_clin)
+
+select(meta, sample_name, grouping, all_of(ind)) |> 
+  pivot_longer(cols = -c(1:2)) |> 
+  ggplot(aes(x = value, color = grouping)) + 
+  geom_density() + 
+  facet_wrap(~ name, ncol = 5, scales = "free") + 
+  theme_mengbo() + 
+  theme(axis.text = element_text(size = 5), 
+        strip.text = element_text(size = 8)) + 
+  labs(color = "Condition")
+```
+
+We take log2-transformation for all continuous variables. We only try to associate FA usage with clinical variables that have observations in both condition groups. 
+
+```{r}
+cont_clin <- setdiff(cont_clin, c("ex_rap", "LVEF", "pcwp_watts_ratio"))
+```
+
+
+
+Usage data is calculated as CS - ART in matched subjects: 
+
+```{r}
+hc_subj <- filter(meta, grouping == "Healthy")
+hc_subj <- names(table(hc_subj$subject))[table(hc_subj$subject) == 2]
+length(hc_subj)
+hf_subj <- filter(meta, grouping == "HFPEF")
+hf_subj <- names(table(hf_subj$subject))[table(hf_subj$subject) == 2]
+length(hf_subj)
+
+subjs <- c(hc_subj, hf_subj)
+
+usage <- lapply(subjs, function(ss) { 
+  smps <- meta$sample_name[meta$subject == ss]
+  cs_smp <- smps[str_detect(smps, "_CS")]
+  art_smp <- setdiff(smps, cs_smp)
+  res <- neg[, cs_smp] - neg[, art_smp]
+}) %>% do.call(cbind, .)
+colnames(usage) <- subjs
+rownames(usage) <- rownames(neg)
+
+usage_meta <- filter(meta, !duplicated(subject)) |> 
+  filter(subject %in% subjs) |> 
+  select(-group, -group2, -sample_name, -sampling_site) |> 
+  arrange(match(subject, subjs))
+```
+
+
+
+
+```{r}
+# table(usage_meta$subject == colnames(usage))
+cont_res <- lapply(cont_clin, function(ii) {
+  tmp <- select(usage_meta, grouping, all_of(ii), subject) |> 
+    distinct() |> 
+    rename(var = 2) |> 
+    filter(!is.na(var)) |> 
+    mutate(log2var = log2(var))
+  rownames(tmp) <- NULL
+  tmp <- tmp |> column_to_rownames("subject")
+  tmp <- tmp[colnames(usage), ]
+  
+  # healthy
+  meta_healthy <- filter(tmp, grouping == "Healthy")
+  usage_healthy <- usage[, rownames(meta_healthy)]
+  design <- model.matrix(~ log2var, data = meta_healthy)
+  fit <- lmFit(usage_healthy, design)
+  efit <- eBayes(fit)
+  res <- decideTests(efit) |> 
+    as.data.frame() |> 
+    mutate(var = ii, stratum = "healthy") |> 
+    rownames_to_column("metabolite")
+  
+  # HFpEF
+  meta_hfpef <- filter(tmp, grouping == "HFPEF")
+  usage_hfpef <- usage[, rownames(meta_hfpef)]
+  design <- model.matrix(~ log2var, data = meta_hfpef)
+  fit <- lmFit(usage_hfpef, design)
+  efit <- eBayes(fit)
+  res2 <- decideTests(efit) |> 
+    as.data.frame() |> 
+    mutate(var = ii, stratum = "HFpEF") |> 
+    rownames_to_column("metabolite")
+  
+  return(add_row(res, res2))
+}) %>% do.call(rbind, .)
+```
+
+
+DE heatmap: 
+
+```{r}
+#| fig-width: 12
+#| fig-height: 8
+
+cont_res <- mutate(cont_res, log2var = factor(log2var, levels = c(1, -1, 0))) |> 
+  filter(!is.na(log2var))
+levels(cont_res$log2var) <- c("Up", "Down", "Insignificant")
+
+(sigRes <- filter(cont_res, log2var != "Insignificant") |> select(-2))
+
+# filter(cont_res, var %in% unique(sigRes$var), 
+#        metabolite %in% c(unique(metabolite)[1:9], "PC(18:0_16:0)+HCOO")) |> 
+#   ggplot(aes(y = var, x = metabolite)) + 
+#   geom_tile(aes(fill= log2var), color = "black") + 
+#   facet_wrap(~ stratum, ncol = 1) + 
+#   theme_mengbo() + 
+#   scale_fill_manual(values = c(sig.col[1], "#F2F2F2")) + 
+#   theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 8), 
+#         axis.text = element_text(size = 10)) + 
+#   labs(fill = "Significance", x = "Clinical variable",  y = "")
+```
+
+
+
+where log2var = 1 means a positive correlation between the clinical variable with metabolite usage (CS - ART). 
+
+Each metabolite
+
+```{r}
+plot_MTBvsCLIN <- function(metabolite, clin) {
+  tmp <- select(usage_meta, grouping, all_of(clin), subject) |> 
+    distinct() |> 
+    rename(var = 2) |> 
+    filter(!is.na(var)) |> 
+    mutate(log2var = log2(var))
+  rownames(tmp) <- NULL
+  tmp <- tmp |> column_to_rownames("subject")
+  tmp <- tmp[colnames(usage), ]
+  
+  # healthy
+  meta_hc <- filter(tmp, grouping == "Healthy")
+  usage_hc <- t(usage[metabolite, rownames(meta_hc), drop = FALSE])
+  
+  df <- cbind(usage_hc, meta_hc) |> as.data.frame() |> 
+    rename(metabolite = 1)
+  
+  lmres <- lm(metabolite ~ log2var, data = df)
+  
+  pt <- ggplot(df, aes(x = log2var, y = metabolite)) + 
+    geom_smooth(formula = "y ~ x", method = "lm", color = "black", linewidth = 0.5, fill = "#D4D4D4") + 
+    geom_point() + 
+    theme_mengbo() + 
+    ggtitle(metabolite) + 
+    ylab("log2usage")
+  
+  return(pt)
+}
+```
+
+
+## Significant associations only in HEALTHY cohort
+
+
+```{r}
+clin1 <- plot_MTBvsCLIN("Hex1Cer(d16:1_22:0)", "rest_dbp") + 
+  xlab("log2rest_dbp")
+
+clin2 <- plot_MTBvsCLIN("PC(17:1_18:2)", "rest_ci") + 
+  xlab("log2rest_ci")
+
+clin3 <- plot_MTBvsCLIN("PC(18:0_16:0)", "peak_watts") + 
+  xlab("log2peak_watts")
+
+ggarrange(clin1, clin2, clin3, nrow = 1, ncol = 3)
+```
+
+```{r}
+# healthy
+
+cont_ttest <- lapply(unique(sigRes$var), function(ii) {
+  tmp <- select(usage_meta, grouping, all_of(ii), subject) |> 
+    distinct() |> 
+    rename(var = 2) |> 
+    filter(!is.na(var)) |> 
+    mutate(log2var = log2(var)) |> 
+    na.omit()
+  rownames(tmp) <- NULL
+  tmp <- tmp |> column_to_rownames("subject")
+  tmp <- tmp[colnames(usage), ]
+  
+  
+  # healthy
+  meta_healthy <- filter(tmp, grouping == "Healthy")
+  usage_healthy <- usage[, rownames(meta_healthy)]
+  design <- model.matrix(~ log2var, data = meta_healthy)
+  fit <- lmFit(usage_healthy, design)
+  efit <- eBayes(fit)
+  res <- decideTests(efit) |> 
+    as.data.frame() |> 
+    mutate(var = ii, stratum = "healthy") |> 
+    rownames_to_column("metabolite")
+  
+  ttest <- topTable(efit, number =  sum(abs(res$log2var)), coef = "log2var") |> 
+    mutate(clin = ii)
+  
+  # # write output
+  # topTable(efit, number =  Inf, coef = "log2var") |>
+  #   rename(coef = logFC) |>
+  #   write.csv(file = paste("tables/neg/230315-neg_lipids_FigXXXX_usageAssociatedClinicalVariables_", ii, "_inHealthy.csv", sep = ""))
+  
+  return(ttest)
+}) %>% do.call(rbind, .)
+
+cont_ttest
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Session information
+
+```{r}
+sessioninfo::session_info()
+```
